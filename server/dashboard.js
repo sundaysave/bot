@@ -3,6 +3,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const QRCode = require('qrcode');
 
 const autoReplies = require('../utils/autoReplies');
 const logger = require('../utils/logger');
@@ -30,9 +31,11 @@ function readBody(req, maxBytes = 1_000_000) {
 function startDashboard(options = {}) {
   const port = Number(process.env.PORT || options.port || 3000);
   const host = process.env.HOST || options.host || '0.0.0.0';
-
-  let latestQr = null;
-  let connectionState = 'connecting';
+  const getSessions = typeof options.getSessions === 'function' ? options.getSessions : () => [];
+  const onCreateSession = typeof options.onCreateSession === 'function' ? options.onCreateSession : null;
+  const onDisconnectSession = typeof options.onDisconnectSession === 'function' ? options.onDisconnectSession : null;
+  const onSignoutSession = typeof options.onSignoutSession === 'function' ? options.onSignoutSession : null;
+  const onReconnectSession = typeof options.onReconnectSession === 'function' ? options.onReconnectSession : null;
   const sseClients = new Set();
 
   function sseBroadcast(event, payload) {
@@ -61,15 +64,102 @@ function startDashboard(options = {}) {
         });
         res.write('\n');
         sseClients.add(res);
-        const init = JSON.stringify({ qr: latestQr, connection: connectionState });
+        const init = JSON.stringify({ sessions: getSessions() });
         res.write(`event: init\ndata: ${init}\n\n`);
         req.on('close', () => sseClients.delete(res));
+        return;
+      }
+
+      if (pathname === '/api/sessions' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(getSessions()));
+        return;
+      }
+
+      if (pathname === '/api/sessions' && req.method === 'POST') {
+        if (!onCreateSession) {
+          res.writeHead(501, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'session creation unavailable' }));
+          return;
+        }
+        const body = await readBody(req);
+        let parsed;
+        try {
+          parsed = JSON.parse(body || '{}');
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
+          return;
+        }
+        const created = await onCreateSession(parsed?.id);
+        res.writeHead(201, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(created));
+        return;
+      }
+
+      const actionMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/(disconnect|signout|reconnect)$/);
+      if (actionMatch && req.method === 'POST') {
+        const id = decodeURIComponent(actionMatch[1]);
+        const action = actionMatch[2];
+        let ok = false;
+        if (action === 'disconnect' && onDisconnectSession) {
+          ok = await onDisconnectSession(id);
+        } else if (action === 'signout' && onSignoutSession) {
+          ok = await onSignoutSession(id);
+        } else if (action === 'reconnect' && onReconnectSession) {
+          ok = await onReconnectSession(id);
+        }
+
+        if (!ok) {
+          res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'session not found or action failed' }));
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true }));
         return;
       }
 
       if (pathname === '/api/auto-replies' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(autoReplies.listReplies()));
+        return;
+      }
+
+      if (pathname === '/api/qr-image' && req.method === 'POST') {
+        let body = '{}';
+        try {
+          body = await readBody(req);
+        } catch (e) {
+          res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: e.message }));
+          return;
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(body || '{}');
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
+          return;
+        }
+
+        const text = String(parsed?.text || '');
+        if (!text) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'text is required' }));
+          return;
+        }
+
+        try {
+          const dataUrl = await QRCode.toDataURL(text, { width: 256, margin: 2 });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ dataUrl }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: e.message || String(e) }));
+        }
         return;
       }
 
@@ -145,13 +235,8 @@ function startDashboard(options = {}) {
   });
 
   return {
-    setQr(qr) {
-      latestQr = qr || null;
-      sseBroadcast('qr', { qr: latestQr });
-    },
-    setConnection(state) {
-      connectionState = state != null ? String(state) : 'connecting';
-      sseBroadcast('connection', { connection: connectionState });
+    setSessions(sessions) {
+      sseBroadcast('sessions', { sessions: Array.isArray(sessions) ? sessions : [] });
     },
     getAddress() {
       return { host, port };

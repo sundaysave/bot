@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "id": "1778406656630-sc1sxxar",
+    "trigger": "hello",
+    "reply": "good",
+    "matchMode": "exact"
+  }
+]

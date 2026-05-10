@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * WhatsApp bot entry — Baileys 7+ ships as ESM, so we dynamic-import it from this CommonJS file.
- * Local modules stay on require() for a simple, beginner-friendly layout.
+ * WhatsApp bot entry with multi-session support.
+ * Each session has its own auth directory and QR lifecycle.
  */
 
+const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
 
@@ -13,46 +14,79 @@ const { handleIncomingMessage } = require('./handlers/commands');
 const { startDashboard } = require('./server/dashboard');
 
 const config = {
-  /** Set COMMAND_PREFIX (e.g. !) so only "!ping" triggers commands; leave empty for plain "ping". */
   commandPrefix: process.env.COMMAND_PREFIX || '',
-  authDir: process.env.AUTH_DIR
+  authRoot: process.env.AUTH_DIR
     ? path.resolve(process.env.AUTH_DIR)
     : path.join(__dirname, 'auth'),
+  sessionsDirName: 'sessions',
 };
 
-let reconnectTimer = null;
-let activeSocket = null;
-let isStarting = false;
 let dashboard = null;
+const sessions = new Map();
+let baileysCache = null;
 
-function clearReconnectTimer() {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
+function sanitizeSessionId(raw) {
+  const base = String(raw || '').trim().toLowerCase();
+  if (!base) return '';
+  return base.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
+
+function getSessionsRootDir() {
+  return path.join(config.authRoot, config.sessionsDirName);
+}
+
+function getSessionAuthDir(sessionId) {
+  return path.join(getSessionsRootDir(), sessionId);
+}
+
+function ensureAuthDirs() {
+  fs.mkdirSync(config.authRoot, { recursive: true });
+  fs.mkdirSync(getSessionsRootDir(), { recursive: true });
+}
+
+function listSessionViews() {
+  const out = [];
+  for (const session of sessions.values()) {
+    out.push({
+      id: session.id,
+      connection: session.connectionState,
+      qr: session.qr,
+      authDir: session.authDir,
+    });
+  }
+  return out.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function publishSessions() {
+  if (dashboard) dashboard.setSessions(listSessionViews());
+}
+
+function clearSessionReconnectTimer(session) {
+  if (session.reconnectTimer) {
+    clearTimeout(session.reconnectTimer);
+    session.reconnectTimer = null;
   }
 }
 
-function scheduleReconnect(fn, delayMs = 3500) {
-  clearReconnectTimer();
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    fn();
+function scheduleSessionReconnect(session, fn, delayMs = 3500) {
+  clearSessionReconnectTimer(session);
+  session.reconnectTimer = setTimeout(() => {
+    session.reconnectTimer = null;
+    fn().catch((e) => logger.error(`Reconnect failed (${session.id})`, e?.message || e));
   }, delayMs);
 }
 
-/**
- * Load Baileys + Boom (ESM) once per process.
- */
 async function loadBaileys() {
+  if (baileysCache) return baileysCache;
   const baileys = await import('@whiskeysockets/baileys');
-
-  return {
+  baileysCache = {
     makeWASocket: baileys.default,
     DisconnectReason: baileys.DisconnectReason,
     useMultiFileAuthState: baileys.useMultiFileAuthState,
     fetchLatestBaileysVersion: baileys.fetchLatestBaileysVersion,
     Browsers: baileys.Browsers,
   };
+  return baileysCache;
 }
 
 function shouldReconnect(lastDisconnect, DisconnectReason) {
@@ -65,7 +99,32 @@ function shouldReconnect(lastDisconnect, DisconnectReason) {
   }
 }
 
-async function createSocket() {
+function createSession(sessionId) {
+  const id = sanitizeSessionId(sessionId);
+  if (!id) {
+    throw new Error('session id is required');
+  }
+  if (sessions.has(id)) {
+    return sessions.get(id);
+  }
+
+  const session = {
+    id,
+    authDir: getSessionAuthDir(id),
+    sock: null,
+    qr: null,
+    isStarting: false,
+    reconnectTimer: null,
+    connectionState: 'idle',
+    autoReconnect: true,
+  };
+  fs.mkdirSync(session.authDir, { recursive: true });
+  sessions.set(id, session);
+  publishSessions();
+  return session;
+}
+
+async function createSocket(session) {
   const {
     makeWASocket,
     DisconnectReason,
@@ -74,7 +133,7 @@ async function createSocket() {
     Browsers,
   } = await loadBaileys();
 
-  const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
+  const { state, saveCreds } = await useMultiFileAuthState(session.authDir);
 
   let version;
   try {
@@ -91,7 +150,7 @@ async function createSocket() {
     version,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    browser: Browsers?.macOS('Baileys Bot') || ['Baileys Bot', 'Chrome', '1.0.0'],
+    browser: Browsers?.macOS(`Baileys Bot ${session.id}`) || ['Baileys Bot', 'Chrome', '1.0.0'],
     markOnlineOnConnect: true,
     getMessage: async () => undefined,
   });
@@ -102,37 +161,43 @@ async function createSocket() {
     try {
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr && dashboard) {
-        dashboard.setQr(qr);
-        logger.info('Scan the QR code in the web dashboard (Linked Devices)');
+      if (qr) {
+        session.qr = qr;
+        logger.info(`Scan QR for session "${session.id}" in dashboard`);
+        publishSessions();
       }
 
-      if (connection && dashboard) {
-        dashboard.setConnection(connection);
+      if (connection) {
+        session.connectionState = String(connection);
+        publishSessions();
       }
 
       if (connection === 'open') {
-        if (dashboard) dashboard.setQr(null);
-        logger.info('WhatsApp Connected');
+        session.qr = null;
+        session.connectionState = 'open';
+        logger.info(`WhatsApp Connected (${session.id})`);
+        publishSessions();
       }
 
       if (connection === 'close') {
-        if (dashboard) dashboard.setQr(null);
+        session.qr = null;
+        session.connectionState = 'close';
         const reasonMsg = lastDisconnect?.error?.message || lastDisconnect?.error || 'unknown';
-        logger.error(`Connection Lost — ${String(reasonMsg)}`);
+        logger.error(`Connection Lost (${session.id}) — ${String(reasonMsg)}`);
+        publishSessions();
 
-        const reconnect = shouldReconnect(lastDisconnect, DisconnectReason);
+        const reconnect = session.autoReconnect && shouldReconnect(lastDisconnect, DisconnectReason);
         if (reconnect) {
-          logger.info('Reconnecting…');
-          scheduleReconnect(() => {
-            start().catch((e) => logger.error('Reconnect start failed', e?.message || e));
+          logger.info(`Reconnecting session "${session.id}"...`);
+          scheduleSessionReconnect(session, async () => {
+            await startSession(session.id);
           });
         } else {
-          logger.warn('Logged out or not reconnecting. Delete auth/ and scan QR again if needed.');
+          logger.warn(`Session "${session.id}" logged out / reconnect disabled. Use dashboard reconnect or signout.`);
         }
       }
     } catch (err) {
-      logger.error('connection.update handler error', err?.message || err);
+      logger.error(`connection.update handler error (${session.id})`, err?.message || err);
     }
   });
 
@@ -145,28 +210,126 @@ async function createSocket() {
         await handleIncomingMessage(sock, msg, config);
       }
     } catch (err) {
-      logger.error('messages.upsert handler error', err?.message || err);
+      logger.error(`messages.upsert handler error (${session.id})`, err?.message || err);
     }
   });
 
-  return sock;
+  return { sock, DisconnectReason };
 }
 
-async function start() {
-  if (isStarting) return;
-  isStarting = true;
+async function startSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  if (session.isStarting) return true;
+  session.isStarting = true;
+  session.autoReconnect = true;
+  session.connectionState = 'connecting';
+  publishSessions();
+
   try {
     try {
-      activeSocket = await createSocket();
+      const out = await createSocket(session);
+      session.sock = out.sock;
+      session.connectionState = 'connecting';
+      publishSessions();
+      return true;
     } catch (err) {
-      logger.error('Failed to create socket', err?.message || err);
-      scheduleReconnect(() => {
-        start().catch((e) => logger.error('Retry start failed', e?.message || e));
+      logger.error(`Failed to create socket (${session.id})`, err?.message || err);
+      scheduleSessionReconnect(session, async () => {
+        await startSession(session.id);
       });
+      return false;
     }
   } finally {
-    isStarting = false;
+    session.isStarting = false;
   }
+}
+
+async function disconnectSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  session.autoReconnect = false;
+  clearSessionReconnectTimer(session);
+  if (session.sock?.ws?.close) {
+    try {
+      session.sock.ws.close();
+    } catch {
+      /* ignore */
+    }
+  }
+  session.sock = null;
+  session.qr = null;
+  session.connectionState = 'disconnected';
+  publishSessions();
+  return true;
+}
+
+function removeDirectorySafe(targetDir) {
+  try {
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  } catch (e) {
+    logger.error(`Failed to remove auth dir: ${targetDir}`, e?.message || e);
+  }
+}
+
+async function signoutSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  session.autoReconnect = false;
+  clearSessionReconnectTimer(session);
+
+  if (session.sock?.logout) {
+    try {
+      await session.sock.logout();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (session.sock?.ws?.close) {
+    try {
+      session.sock.ws.close();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  session.sock = null;
+  session.qr = null;
+  session.connectionState = 'signed-out';
+  removeDirectorySafe(session.authDir);
+  fs.mkdirSync(session.authDir, { recursive: true });
+  publishSessions();
+  return true;
+}
+
+async function reconnectSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  await disconnectSession(sessionId);
+  session.autoReconnect = true;
+  await startSession(sessionId);
+  return true;
+}
+
+function createNextSessionId() {
+  let i = 2;
+  while (sessions.has(`device-${i}`)) i += 1;
+  return `device-${i}`;
+}
+
+async function createAndStartSession(maybeId) {
+  const requested = sanitizeSessionId(maybeId);
+  const id = requested || createNextSessionId();
+  const session = createSession(id);
+  await startSession(session.id);
+  publishSessions();
+  return {
+    id: session.id,
+    authDir: session.authDir,
+    connection: session.connectionState,
+    qr: session.qr,
+  };
 }
 
 function installProcessGuards() {
@@ -181,18 +344,26 @@ function installProcessGuards() {
 
 async function main() {
   installProcessGuards();
+  ensureAuthDirs();
 
-  dashboard = startDashboard();
+  dashboard = startDashboard({
+    getSessions: () => listSessionViews(),
+    onCreateSession: async (id) => createAndStartSession(id),
+    onDisconnectSession: async (id) => disconnectSession(id),
+    onSignoutSession: async (id) => signoutSession(id),
+    onReconnectSession: async (id) => reconnectSession(id),
+  });
   const { port } = dashboard.getAddress();
 
   logger.printBanner('WhatsApp Bot — Baileys', [
-    `Auth folder: ${config.authDir}`,
+    `Auth root: ${config.authRoot}`,
     `Command prefix: ${config.commandPrefix ? `"${config.commandPrefix}"` : '(none — plain commands)'}`,
     `Dashboard: http://localhost:${port}`,
+    'Use dashboard for add/reconnect/disconnect/signout sessions',
     'Press Ctrl+C to stop',
   ]);
 
-  await start();
+  await createAndStartSession('device-1');
 }
 
 main().catch((err) => {

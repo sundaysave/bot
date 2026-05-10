@@ -4,7 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WhatsApp Bot — Dashboard</title>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
   <style>
     :root {
       --bg: #0f1419;
@@ -99,6 +98,51 @@
       display: none;
     }
     #qrCanvas.visible { display: block; }
+    .devices {
+      display: grid;
+      gap: 0.8rem;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+    .device-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.75rem;
+      background: rgba(15, 20, 25, 0.55);
+    }
+    .device-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+    .device-id {
+      font-weight: 700;
+      font-size: 0.9rem;
+    }
+    .small {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .btn-secondary {
+      background: rgba(61, 156, 245, 0.2);
+      color: var(--text);
+      padding: 0.35rem 0.65rem;
+      font-size: 0.8rem;
+    }
+    .btn-secondary:hover { background: rgba(61, 156, 245, 0.35); }
+    .actions { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.55rem; }
+    .device-qr {
+      display: none;
+      background: #fff;
+      border-radius: 8px;
+      padding: 8px;
+      margin-top: 0.6rem;
+      width: 160px;
+      height: 160px;
+      object-fit: contain;
+    }
+    .device-qr.visible { display: block; }
     .qr-hint {
       color: var(--muted);
       font-size: 0.88rem;
@@ -182,19 +226,39 @@
 <body>
   <header>
     <h1>WhatsApp Bot dashboard</h1>
-    <p>Pair with QR, then manage auto-replies (first matching rule wins).</p>
+    <p>Manage multiple WhatsApp sessions (each with its own QR) and auto-replies.</p>
   </header>
   <main>
-    <section class="card">
-      <h2>Connection</h2>
-      <div id="statusLine" class="status"><span class="dot connecting" id="statusDot"></span><span id="statusText">connecting…</span></div>
-      <p class="note">WhatsApp: Settings → Linked devices → Link a device — scan the code below when it appears.</p>
-    </section>
-    <section class="card">
-      <h2>Login QR</h2>
-      <div class="qr-wrap">
-        <canvas id="qrCanvas" width="256" height="256" aria-label="WhatsApp QR code"></canvas>
-        <p class="qr-hint" id="qrHint">Waiting for a QR code from the bot…</p>
+    <section class="card span-2">
+      <h2>Devices / Sessions</h2>
+      <div class="row cols-2">
+        <div>
+          <label for="sessionId">New session ID (optional)</label>
+          <input id="sessionId" type="text" placeholder="device-2" autocomplete="off" />
+        </div>
+        <div style="display:flex;align-items:end">
+          <button type="button" class="btn-primary" id="addSessionBtn">Add session</button>
+        </div>
+      </div>
+      <div class="err" id="sessionErr" hidden></div>
+      <p class="note">Open WhatsApp → Linked devices → Link a device. Each session can be disconnected or signed out independently.</p>
+      <div id="devices" class="devices"></div>
+      <div id="devicesEmpty" class="small">No sessions yet.</div>
+      <div id="devicesTpl" hidden>
+        <div class="device-card">
+          <div class="device-top">
+            <div class="device-id"></div>
+            <div class="status"><span class="dot"></span><span class="state"></span></div>
+          </div>
+          <div class="small auth-path"></div>
+          <img class="device-qr" alt="Session QR code" />
+          <div class="small qr-hint"></div>
+          <div class="actions">
+            <button class="btn-secondary reconnect-btn" type="button">Reconnect</button>
+            <button class="btn-secondary disconnect-btn" type="button">Disconnect</button>
+            <button class="btn-danger signout-btn" type="button">Sign out</button>
+          </div>
+        </div>
       </div>
     </section>
     <section class="card span-2">
@@ -240,60 +304,129 @@
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
+    let sessions = [];
 
-    function setStatus(conn) {
-      const text = $('statusText');
-      const dot = $('statusDot');
-      const raw = (conn || 'connecting').toLowerCase();
-      text.textContent = raw;
-      dot.className = 'dot ' + raw.replace(/\s+/g, '');
+    function dotClassForState(raw) {
+      const state = (raw || '').toLowerCase();
+      if (state === 'open') return 'open';
+      if (state === 'close' || state === 'closed' || state === 'signed-out' || state === 'disconnected') return 'close';
+      return 'connecting';
     }
 
-    function showQr(qrData) {
-      const canvas = $('qrCanvas');
-      const hint = $('qrHint');
-      if (!qrData) {
-        canvas.classList.remove('visible');
-        hint.textContent = 'No QR right now (already linked or reconnecting).';
-        return;
-      }
-      hint.textContent = 'Scan with WhatsApp on your phone.';
-      if (typeof QRCode === 'undefined') {
-        hint.textContent = 'QR library still loading; refresh if this stays.';
-        return;
-      }
-      QRCode.toCanvas(canvas, qrData, { width: 256, margin: 2 }, (err) => {
-        if (err) {
-          hint.textContent = 'Could not render QR: ' + err.message;
-          return;
+    function renderSessions() {
+      const wrap = $('devices');
+      const tpl = $('devicesTpl').firstElementChild;
+      wrap.innerHTML = '';
+      $('devicesEmpty').style.display = sessions.length ? 'none' : 'block';
+
+      for (const s of sessions) {
+        const node = tpl.cloneNode(true);
+        node.querySelector('.device-id').textContent = s.id;
+        node.querySelector('.auth-path').textContent = s.authDir || '';
+        node.querySelector('.state').textContent = s.connection || 'idle';
+        node.querySelector('.dot').className = 'dot ' + dotClassForState(s.connection);
+
+        const qrImage = node.querySelector('.device-qr');
+        const qrHint = node.querySelector('.qr-hint');
+        if (s.qr) {
+          qrHint.textContent = 'Generating QR...';
+          fetchQrImage(s.qr, qrImage, qrHint);
+        } else {
+          qrImage.classList.remove('visible');
+          qrImage.removeAttribute('src');
+          qrHint.textContent = 'No QR right now.';
         }
-        canvas.classList.add('visible');
-      });
+
+        node.querySelector('.disconnect-btn').onclick = () => sessionAction(s.id, 'disconnect');
+        node.querySelector('.signout-btn').onclick = () => sessionAction(s.id, 'signout');
+        node.querySelector('.reconnect-btn').onclick = () => sessionAction(s.id, 'reconnect');
+
+        wrap.appendChild(node);
+      }
     }
+
+    async function fetchQrImage(text, target, hintNode) {
+      try {
+        const res = await fetch('/api/qr-image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok || !payload.dataUrl) {
+          throw new Error(payload.error || 'QR generation failed');
+        }
+        target.src = payload.dataUrl;
+        target.classList.add('visible');
+        hintNode.textContent = 'Scan this QR for this session.';
+      } catch (e) {
+        target.classList.remove('visible');
+        hintNode.textContent = e.message;
+      }
+    }
+
+    async function sessionAction(id, action) {
+      $('sessionErr').hidden = true;
+      try {
+        const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/' + action, {
+          method: 'POST',
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.error || action + ' failed');
+        await loadSessions();
+      } catch (e) {
+        $('sessionErr').textContent = e.message;
+        $('sessionErr').hidden = false;
+      }
+    }
+
+    async function loadSessions() {
+      const res = await fetch('/api/sessions');
+      if (!res.ok) throw new Error('Failed to load sessions');
+      sessions = await res.json();
+      renderSessions();
+    }
+
+    async function addSession() {
+      $('sessionErr').hidden = true;
+      const id = $('sessionId').value.trim();
+      try {
+        const res = await fetch('/api/sessions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.error || 'Create session failed');
+        $('sessionId').value = '';
+        await loadSessions();
+      } catch (e) {
+        $('sessionErr').textContent = e.message;
+        $('sessionErr').hidden = false;
+      }
+    }
+
+    $('addSessionBtn').onclick = addSession;
 
     function connectSse() {
       const es = new EventSource('/api/events');
       es.addEventListener('init', (e) => {
         try {
           const d = JSON.parse(e.data);
-          if (d.connection) setStatus(d.connection);
-          showQr(d.qr);
+          sessions = Array.isArray(d.sessions) ? d.sessions : [];
+          renderSessions();
         } catch (_) {}
       });
-      es.addEventListener('qr', (e) => {
+      es.addEventListener('sessions', (e) => {
         try {
           const d = JSON.parse(e.data);
-          showQr(d.qr);
-        } catch (_) {}
-      });
-      es.addEventListener('connection', (e) => {
-        try {
-          const d = JSON.parse(e.data);
-          if (d.connection) setStatus(d.connection);
+          sessions = Array.isArray(d.sessions) ? d.sessions : [];
+          renderSessions();
         } catch (_) {}
       });
       es.onerror = () => {
-        $('statusText').textContent = 'dashboard stream disconnected (retrying…)';
+        $('sessionErr').textContent = 'Dashboard stream disconnected (retrying...)';
+        $('sessionErr').hidden = false;
       };
     }
 
@@ -361,6 +494,10 @@
     window.addEventListener('load', () => {
       connectSse();
       loadRules();
+      loadSessions().catch((e) => {
+        $('sessionErr').textContent = e.message;
+        $('sessionErr').hidden = false;
+      });
     });
   </script>
 </body>
