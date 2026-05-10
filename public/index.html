@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WhatsApp Bot — Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2d3a4d;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --accent: #3d9cf5;
+      --ok: #3ecf8e;
+      --warn: #f5a524;
+      --danger: #f05d5e;
+      --radius: 10px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      padding: 1.25rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 650;
+    }
+    header p {
+      margin: 0.35rem 0 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 1.25rem 1.5rem 2.5rem;
+      display: grid;
+      gap: 1.25rem;
+    }
+    @media (min-width: 840px) {
+      main { grid-template-columns: 1fr 1fr; align-items: start; }
+      .span-2 { grid-column: 1 / -1; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem;
+    }
+    .card h2 {
+      margin: 0 0 0.75rem;
+      font-size: 0.95rem;
+      font-weight: 650;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+    .dot.open { background: var(--ok); }
+    .dot.close, .dot.closed { background: var(--danger); }
+    .dot.connecting { background: var(--warn); }
+    .qr-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+      min-height: 220px;
+      justify-content: center;
+    }
+    #qrCanvas {
+      background: #fff;
+      padding: 10px;
+      border-radius: 8px;
+      max-width: 100%;
+      display: none;
+    }
+    #qrCanvas.visible { display: block; }
+    .qr-hint {
+      color: var(--muted);
+      font-size: 0.88rem;
+      text-align: center;
+      max-width: 280px;
+    }
+    label {
+      display: block;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.25rem;
+    }
+    input, select {
+      width: 100%;
+      padding: 0.55rem 0.65rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.95rem;
+    }
+    input:focus, select:focus {
+      outline: 2px solid rgba(61, 156, 245, 0.35);
+      border-color: var(--accent);
+    }
+    .row {
+      display: grid;
+      gap: 0.65rem;
+      margin-bottom: 0.65rem;
+    }
+    @media (min-width: 520px) {
+      .row.cols-2 { grid-template-columns: 1fr 1fr; }
+    }
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      padding: 0.55rem 1rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #061018;
+    }
+    .btn-primary:hover { filter: brightness(1.06); }
+    .btn-danger {
+      background: rgba(240, 93, 94, 0.2);
+      color: var(--danger);
+      padding: 0.35rem 0.65rem;
+      font-size: 0.8rem;
+    }
+    .btn-danger:hover { background: rgba(240, 93, 94, 0.3); }
+    .toolbar { margin-top: 0.5rem; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.5rem 0.4rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; }
+    tr:last-child td { border-bottom: none; }
+    .mono { font-family: ui-monospace, monospace; font-size: 0.82rem; word-break: break-word; }
+    .err {
+      margin-top: 0.5rem;
+      color: var(--danger);
+      font-size: 0.85rem;
+    }
+    .note {
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-top: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WhatsApp Bot dashboard</h1>
+    <p>Pair with QR, then manage auto-replies (first matching rule wins).</p>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Connection</h2>
+      <div id="statusLine" class="status"><span class="dot connecting" id="statusDot"></span><span id="statusText">connecting…</span></div>
+      <p class="note">WhatsApp: Settings → Linked devices → Link a device — scan the code below when it appears.</p>
+    </section>
+    <section class="card">
+      <h2>Login QR</h2>
+      <div class="qr-wrap">
+        <canvas id="qrCanvas" width="256" height="256" aria-label="WhatsApp QR code"></canvas>
+        <p class="qr-hint" id="qrHint">Waiting for a QR code from the bot…</p>
+      </div>
+    </section>
+    <section class="card span-2">
+      <h2>Auto-replies</h2>
+      <p class="note" style="margin:0 0 0.75rem">Example: trigger <span class="mono">hi</span> → reply <span class="mono">hello</span>. Runs before built-in commands.</p>
+      <div class="row cols-2">
+        <div>
+          <label for="trigger">When message matches</label>
+          <input id="trigger" type="text" placeholder="hi" autocomplete="off" />
+        </div>
+        <div>
+          <label for="matchMode">Match mode</label>
+          <select id="matchMode">
+            <option value="exact">Exact (whole message)</option>
+            <option value="contains">Contains</option>
+            <option value="startsWith">Starts with</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="reply">Reply with</label>
+          <input id="reply" type="text" placeholder="hello" autocomplete="off" />
+        </div>
+      </div>
+      <div class="toolbar">
+        <button type="button" class="btn-primary" id="addBtn">Add rule</button>
+      </div>
+      <div class="err" id="formErr" hidden></div>
+      <table style="margin-top:1rem">
+        <thead>
+          <tr>
+            <th>Trigger</th>
+            <th>Mode</th>
+            <th>Reply</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rulesBody"></tbody>
+      </table>
+      <p class="err" id="tableErr" hidden></p>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function setStatus(conn) {
+      const text = $('statusText');
+      const dot = $('statusDot');
+      const raw = (conn || 'connecting').toLowerCase();
+      text.textContent = raw;
+      dot.className = 'dot ' + raw.replace(/\s+/g, '');
+    }
+
+    function showQr(qrData) {
+      const canvas = $('qrCanvas');
+      const hint = $('qrHint');
+      if (!qrData) {
+        canvas.classList.remove('visible');
+        hint.textContent = 'No QR right now (already linked or reconnecting).';
+        return;
+      }
+      hint.textContent = 'Scan with WhatsApp on your phone.';
+      if (typeof QRCode === 'undefined') {
+        hint.textContent = 'QR library still loading; refresh if this stays.';
+        return;
+      }
+      QRCode.toCanvas(canvas, qrData, { width: 256, margin: 2 }, (err) => {
+        if (err) {
+          hint.textContent = 'Could not render QR: ' + err.message;
+          return;
+        }
+        canvas.classList.add('visible');
+      });
+    }
+
+    function connectSse() {
+      const es = new EventSource('/api/events');
+      es.addEventListener('init', (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          if (d.connection) setStatus(d.connection);
+          showQr(d.qr);
+        } catch (_) {}
+      });
+      es.addEventListener('qr', (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          showQr(d.qr);
+        } catch (_) {}
+      });
+      es.addEventListener('connection', (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          if (d.connection) setStatus(d.connection);
+        } catch (_) {}
+      });
+      es.onerror = () => {
+        $('statusText').textContent = 'dashboard stream disconnected (retrying…)';
+      };
+    }
+
+    async function loadRules() {
+      $('tableErr').hidden = true;
+      try {
+        const res = await fetch('/api/auto-replies');
+        if (!res.ok) throw new Error('Failed to load rules');
+        const rows = await res.json();
+        const tbody = $('rulesBody');
+        tbody.innerHTML = '';
+        for (const r of rows) {
+          const tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td class="mono"></td><td class="mono"></td><td class="mono"></td><td></td>';
+          tr.children[0].textContent = r.trigger;
+          tr.children[1].textContent = r.matchMode || 'exact';
+          tr.children[2].textContent = r.reply;
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'btn-danger';
+          btn.textContent = 'Delete';
+          btn.onclick = () => deleteRule(r.id);
+          tr.children[3].appendChild(btn);
+          tbody.appendChild(tr);
+        }
+      } catch (e) {
+        $('tableErr').textContent = e.message;
+        $('tableErr').hidden = false;
+      }
+    }
+
+    async function deleteRule(id) {
+      const res = await fetch('/api/auto-replies?id=' + encodeURIComponent(id), { method: 'DELETE' });
+      if (!res.ok) {
+        $('tableErr').textContent = 'Delete failed';
+        $('tableErr').hidden = false;
+        return;
+      }
+      loadRules();
+    }
+
+    $('addBtn').onclick = async () => {
+      $('formErr').hidden = true;
+      const trigger = $('trigger').value.trim();
+      const reply = $('reply').value.trim();
+      const matchMode = $('matchMode').value;
+      try {
+        const res = await fetch('/api/auto-replies', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ trigger, reply, matchMode }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Add failed');
+        $('trigger').value = '';
+        $('reply').value = '';
+        loadRules();
+      } catch (e) {
+        $('formErr').textContent = e.message;
+        $('formErr').hidden = false;
+      }
+    };
+
+    window.addEventListener('load', () => {
+      connectSse();
+      loadRules();
+    });
+  </script>
+</body>
+</html>
